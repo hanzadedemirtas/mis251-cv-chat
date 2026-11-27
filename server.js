@@ -9,6 +9,9 @@ const DEFAULT_MODELS = [
   "gemini-2.5-flash",
   "gemini-3.8-flash",
   "gemini-flash-latest",
+  "gemini-3.5-flash-lite",
+  "gemini-flash-lite-latest",
+  "gemini-3.1-flash-lite",
   "gemini-3.7-flash",
   "gemini-3.5-flash",
 ];
@@ -80,7 +83,7 @@ Languages:
 - English (Advanced - Academic & Technical)
 --- END PROFILE ---`;
 
-async function callGeminiModel(model, apiKey, contents, signal) {
+async function callGeminiModel(model, apiKey, contents) {
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
   const response = await fetch(endpoint, {
     method: "POST",
@@ -98,7 +101,7 @@ async function callGeminiModel(model, apiKey, contents, signal) {
         maxOutputTokens: 600,
       },
     }),
-    signal,
+    signal: AbortSignal.timeout(10000),
   });
 
   const data = await response.json().catch(() => ({}));
@@ -148,9 +151,6 @@ app.post("/api/chat", async (req, res) => {
     { role: "user", parts: [{ text: rawMessage }] },
   ];
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25000);
-
   try {
     let lastErrorStatus = 502;
     let lastErrorMessage = "Upstream request failed";
@@ -159,12 +159,25 @@ app.post("/api/chat", async (req, res) => {
 
     for (const candidate of [...availableModels]) {
       usedModel = candidate;
-      const { response, data } = await callGeminiModel(
-        candidate,
-        apiKey,
-        contents,
-        controller.signal
-      );
+      let response;
+      let data;
+
+      try {
+        ({ response, data } = await callGeminiModel(candidate, apiKey, contents));
+      } catch (attemptErr) {
+        if (attemptErr.name === "TimeoutError" || attemptErr.name === "AbortError") {
+          console.warn(`Gemini model ${candidate} timed out; trying next candidate.`);
+          if (availableModels.length > 1) {
+            availableModels = [
+              ...availableModels.filter((m) => m !== candidate),
+              candidate,
+            ];
+            continue;
+          }
+          return res.status(504).json({ error: "AI request timed out. Please try again." });
+        }
+        throw attemptErr;
+      }
 
       if (response.ok) {
         succeededData = data;
@@ -181,6 +194,10 @@ app.post("/api/chat", async (req, res) => {
       }
 
       if ((response.status === 503 || response.status === 429) && availableModels.length > 1) {
+        availableModels = [
+          ...availableModels.filter((m) => m !== candidate),
+          candidate,
+        ];
         continue;
       }
 
@@ -207,13 +224,8 @@ app.post("/api/chat", async (req, res) => {
 
     return res.json({ reply, model: usedModel });
   } catch (err) {
-    if (err.name === "AbortError") {
-      return res.status(504).json({ error: "AI request timed out. Please try again." });
-    }
     console.error("Chat handler error:", err.message);
     return res.status(500).json({ error: "Unexpected server error while generating reply." });
-  } finally {
-    clearTimeout(timeout);
   }
 });
 
